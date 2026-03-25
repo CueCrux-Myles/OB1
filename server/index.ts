@@ -316,17 +316,53 @@ server.registerTool(
         extractMetadata(content),
       ]);
 
-      const { error } = await supabase.from("thoughts").insert({
-        content,
-        embedding,
-        metadata: { ...metadata, source: "mcp" },
+      // Try to use the upsert_thought RPC if the user has installed the content-fingerprint-dedup primitive
+      const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
+        p_content: content,
+        p_payload: { metadata: { ...metadata, source: "mcp" } },
       });
 
-      if (error) {
+      let thoughtId: string;
+
+      // If the RPC doesn't exist (PGRST202), fallback to standard insert
+      if (upsertError && upsertError.code === "PGRST202") {
+        const { data: insertData, error: insertError } = await supabase
+          .from("thoughts")
+          .insert({
+            content,
+            embedding,
+            metadata: { ...metadata, source: "mcp" },
+          })
+          .select("id")
+          .single();
+
+        if (insertError) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to capture: ${insertError.message}` }],
+            isError: true,
+          };
+        }
+        thoughtId = insertData.id;
+      } else if (upsertError) {
+        // Some other error occurred with the RPC
         return {
-          content: [{ type: "text" as const, text: `Failed to capture: ${error.message}` }],
+          content: [{ type: "text" as const, text: `Failed to capture: ${upsertError.message}` }],
           isError: true,
         };
+      } else {
+        // RPC succeeded, now we need to update the embedding
+        thoughtId = upsertResult?.id;
+        const { error: embError } = await supabase
+          .from("thoughts")
+          .update({ embedding })
+          .eq("id", thoughtId);
+
+        if (embError) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to save embedding: ${embError.message}` }],
+            isError: true,
+          };
+        }
       }
 
       const meta = metadata as Record<string, unknown>;
